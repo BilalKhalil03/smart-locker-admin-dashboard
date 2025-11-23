@@ -22,29 +22,38 @@ import {
  *
  * ✅ WRITES TO:
  *   - setDoc(doc(db, "lockers", id)) -> add locker
- *   - updateDoc(doc(db, "lockers", id)) -> update price, lockState, etc.
+ *   - updateDoc(doc(db, "lockers", id)) -> update price & lockState
  *   - deleteDoc(doc(db, "lockers", id)) -> remove locker
  *
- * Your CURRENT Firestore schema (based on screenshots):
+ * Your CURRENT Firestore schema (from your screenshots):
  *
  * lockers/{docId}:
- *  - id: string (optional)
+ *  - id: string (optional, redundant)
  *  - label: string
  *  - location: string
  *
- *  - status: "open" | "closed"          <-- DOOR STATUS (reed switch)
- *  - lockState: 0 | 1                   <-- LOCK STATUS (solenoid)
+ *  - status: string
+ *      ex: "open" | "closed" (reed switch door state)
+ *          "reserved" | "available" (app-defined state)
+ *          "offline" | "malfunction" (health flags)
  *
- *  - reservationUntil: Timestamp | null
+ *  - lockState: 0 | 1
+ *      0 = locked
+ *      1 = unlocked
+ *      (this is what admin button controls)
+ *
+ *  - reservationUntil: Timestamp | ISO string | null
+ *      (right now you store ISO string, so we support both formats)
+ *
  *  - lastUpdated: Timestamp
- *  - pricePerHour: number (you added)
+ *  - pricePerHour: number
  *  - size: "S" | "M" | "L" (optional)
  */
 
-// Door status comes from reed switch (status field in Firestore)
-type DoorStatus = "open" | "closed" | "unknown";
+// We keep status flexible because your DB uses multiple values
+type DoorStatus = string;
 
-// Lock state comes from solenoid control (lockState field in Firestore)
+// Lock state is strictly numeric per your requirement
 type LockState = 0 | 1; // 0 = locked, 1 = unlocked
 
 type Locker = {
@@ -52,13 +61,13 @@ type Locker = {
   label?: string;
   location?: string;
 
-  // ✅ Door reed switch state (Firestore field: status)
+  // ✅ Door / reed switch status (Firestore field: status)
   doorStatus?: DoorStatus;
 
   // ✅ Solenoid lock state (Firestore field: lockState)
   lockState?: LockState;
 
-  reservationUntil?: any;  // Firestore Timestamp or null
+  reservationUntil?: any;  // Timestamp OR ISO string OR null
   lastUpdated?: any;       // Firestore Timestamp
 
   pricePerHour?: number;
@@ -73,17 +82,15 @@ export default function LockersPage() {
 
   /**
    * Add Locker form (admin inputs).
-   *
-   * NOTE:
-   * - doorStatus is only an initial value.
-   *   The ESP32 / reed switch will overwrite status live later.
+   * - doorStatus here is only an INITIAL value.
+   *   The ESP32 or mobile app may overwrite status later.
    * - lockState initializes to 0 (locked).
    */
   const [form, setForm] = useState({
     id: "",
     label: "",
     location: "",
-    doorStatus: "closed" as DoorStatus,
+    doorStatus: "closed",  // initial door state
     pricePerHour: 2.0,
     size: "M" as "S" | "M" | "L",
   });
@@ -91,7 +98,7 @@ export default function LockersPage() {
   /**
    * ✅ LIVE READ:
    * Subscribe to /lockers collection.
-   * Any updates from mobile app or ESP32 show up instantly.
+   * Any updates from mobile or ESP32 show instantly.
    */
   useEffect(() => {
     const q = query(collection(db, "lockers"), orderBy("label"));
@@ -107,9 +114,9 @@ export default function LockersPage() {
             label: data.label,
             location: data.location,
 
-            // Map Firestore fields -> UI fields
-            doorStatus: data.status,     // ✅ Firestore "status" is door open/closed
-            lockState: data.lockState,   // ✅ Firestore numeric lock state
+            // Firestore -> UI mapping
+            doorStatus: data.status,     // ✅ reads door/app status
+            lockState: data.lockState,   // ✅ reads numeric lock state
 
             reservationUntil: data.reservationUntil,
             lastUpdated: data.lastUpdated,
@@ -130,21 +137,59 @@ export default function LockersPage() {
     return () => unsub();
   }, []);
 
-  /** Format Firestore Timestamp safely */
-  const fmtTS = (ts: any) =>
-    ts?.toDate?.()?.toLocaleString?.() ?? "—";
+  /**
+   * Format reservationUntil safely.
+   *
+   * Firestore can store dates as:
+   * 1) Timestamp (has .toDate())
+   * 2) ISO string (like your screenshot)
+   * 3) JS Date
+   *
+   * This supports all three.
+   */
+  const fmtReservedUntil = (val: any) => {
+    if (!val) return "—";
+
+    // Case 1: Firestore Timestamp
+    if (typeof val?.toDate === "function") {
+      return val.toDate().toLocaleString();
+    }
+
+    // Case 2: ISO string
+    if (typeof val === "string") {
+      const d = new Date(val);
+      return isNaN(d.getTime()) ? "—" : d.toLocaleString();
+    }
+
+    // Case 3: JS Date
+    if (val instanceof Date) {
+      return val.toLocaleString();
+    }
+
+    return "—";
+  };
 
   /**
-   * Door Status pill (reed switch)
-   * Shows open/closed clearly.
+   * Door Status pill (reed switch or app status).
+   * We color known values, otherwise show gray pill.
    */
   const doorStatusPill = (s?: DoorStatus) => {
+    const status = (s ?? "unknown").toLowerCase();
+
     const map: Record<string, string> = {
       open: "bg-blue-600/20 text-blue-300",
       closed: "bg-emerald-600/20 text-emerald-300",
+      reserved: "bg-amber-600/20 text-amber-300",
+      available: "bg-emerald-600/20 text-emerald-300",
+      offline: "bg-zinc-700/40 text-zinc-300",
+      malfunction: "bg-rose-600/20 text-rose-300",
+      locked: "bg-emerald-600/20 text-emerald-300",
+      unlocked: "bg-blue-600/20 text-blue-300",
       unknown: "bg-zinc-700/40 text-zinc-300",
     };
-    const cls = map[s ?? "unknown"] ?? map.unknown;
+
+    const cls = map[status] ?? map.unknown;
+
     return (
       <span className={`px-2 py-1 rounded text-xs ${cls}`}>
         {s ?? "unknown"}
@@ -153,7 +198,7 @@ export default function LockersPage() {
   };
 
   /**
-   * Lock State pill (solenoid)
+   * Lock State pill (solenoid).
    * lockState: 0=locked, 1=unlocked
    */
   const lockStatePill = (lockState?: LockState) => {
@@ -186,11 +231,11 @@ export default function LockersPage() {
       label: form.label || form.id.trim(),
       location: form.location || "Unknown",
 
-      // ✅ initial door status (reed)
+      // ✅ Initial reed/app door status
       status: form.doorStatus,
 
-      // ✅ initial lock state (solenoid)
-      lockState: 0, // default locked
+      // ✅ Initial solenoid lock state
+      lockState: 0,
 
       reservationUntil: null,
       lastUpdated: serverTimestamp(),
@@ -232,13 +277,11 @@ export default function LockersPage() {
 
   /**
    * ✅ WRITE:
-   * Toggle lockState directly:
+   * Toggle lockState directly in Firestore:
    * 0 -> 1 (unlock)
    * 1 -> 0 (lock)
    *
-   * IMPORTANT:
    * This is your solenoid control state.
-   * ESP32 should listen for this change if you're not using commands now.
    */
   const toggleLockState = async (locker: Locker) => {
     try {
@@ -248,11 +291,6 @@ export default function LockersPage() {
       await updateDoc(doc(db, "lockers", locker.id), {
         lockState: next,
         lastUpdated: serverTimestamp(),
-
-        // OPTIONAL:
-        // If you want solenoid state to also affect "status",
-        // uncomment this. But usually reed switch should own status.
-        // status: next === 1 ? "open" : "closed",
       });
     } catch (err) {
       console.error("Failed to toggle lockState:", err);
@@ -260,6 +298,13 @@ export default function LockersPage() {
     }
   };
 
+  /**
+   * Reserved count (simple):
+   * counts any locker that has a reservationUntil value.
+   *
+   * If you later want "reserved only when until>now",
+   * tell me and we’ll switch to a future-only check.
+   */
   const reservedCount = useMemo(
     () => lockers.filter((l) => l.reservationUntil != null).length,
     [lockers]
@@ -289,7 +334,7 @@ export default function LockersPage() {
             <label className="text-sm">
               Locker ID (doc id)
               <input
-                className="w-full mt-1 bg-transparent border border-zinc-700 rounded px-2 py-1"
+                                className="w-full mt-1 bg-transparent border border-zinc-700 rounded px-2 py-1"
                 value={form.id}
                 onChange={(e) => setForm({ ...form, id: e.target.value })}
                 placeholder="L-301"
@@ -352,11 +397,13 @@ export default function LockersPage() {
                 className="w-full mt-1 bg-transparent border border-zinc-700 rounded px-2 py-1"
                 value={form.doorStatus}
                 onChange={(e) =>
-                  setForm({ ...form, doorStatus: e.target.value as DoorStatus })
+                  setForm({ ...form, doorStatus: e.target.value })
                 }
               >
                 <option value="closed">closed</option>
                 <option value="open">open</option>
+                <option value="available">available</option>
+                <option value="reserved">reserved</option>
               </select>
             </label>
           </div>
@@ -386,7 +433,7 @@ export default function LockersPage() {
               <th className="p-3 text-left">Label</th>
               <th className="p-3 text-left">Location</th>
 
-              {/* NEW: two distinct status columns */}
+              {/* Two distinct status columns */}
               <th className="p-3 text-center">Door (reed)</th>
               <th className="p-3 text-center">Lock (solenoid)</th>
 
@@ -419,18 +466,19 @@ export default function LockersPage() {
                 <td className="p-3">{l.label ?? "—"}</td>
                 <td className="p-3">{l.location ?? "—"}</td>
 
-                {/* Door state from reed switch */}
+                {/* Door state from reed/app (status) */}
                 <td className="p-3 text-center">
                   {doorStatusPill(l.doorStatus)}
                 </td>
 
-                {/* Lock state from solenoid */}
+                {/* Lock state from solenoid (lockState) */}
                 <td className="p-3 text-center">
                   {lockStatePill(l.lockState)}
                 </td>
 
+                {/* reservationUntil now renders even if ISO string */}
                 <td className="p-3 text-center">
-                  {fmtTS(l.reservationUntil)}
+                  {fmtReservedUntil(l.reservationUntil)}
                 </td>
 
                 <td className="p-3 text-center">
