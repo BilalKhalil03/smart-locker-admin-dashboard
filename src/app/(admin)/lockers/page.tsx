@@ -12,64 +12,52 @@ import {
   serverTimestamp,
   query,
   orderBy,
+  addDoc,
 } from "firebase/firestore";
 
 /**
  * LOCKERS PAGE (LIVE)
  *
  * ✅ READS FROM:
- *   - collection(db, "lockers")  -> realtime list of lockers
+ *   - /lockers
  *
  * ✅ WRITES TO:
- *   - setDoc(doc(db, "lockers", id)) -> add locker
- *   - updateDoc(doc(db, "lockers", id)) -> update price & lockState
- *   - deleteDoc(doc(db, "lockers", id)) -> remove locker
+ *   - /lockers  (add / update / delete)
+ *   - /logs     (activity records for admin actions)
  *
- * Your CURRENT Firestore schema (from your screenshots):
+ * Firestore locker schema:
+ * lockers/{docId}
+ *  - id
+ *  - label
+ *  - location
+ *  - status           // reed switch / door state
+ *  - lockState        // 0 = locked, 1 = unlocked
+ *  - reservationUntil
+ *  - lastUpdated
+ *  - pricePerHour
+ *  - size
  *
- * lockers/{docId}:
- *  - id: string (optional, redundant)
- *  - label: string
- *  - location: string
- *
- *  - status: string
- *      ex: "open" | "closed" (reed switch door state)
- *          "reserved" | "available" (app-defined state)
- *          "offline" | "malfunction" (health flags)
- *
- *  - lockState: 0 | 1
- *      0 = locked
- *      1 = unlocked
- *      (this is what admin button controls)
- *
- *  - reservationUntil: Timestamp | ISO string | null
- *      (right now you store ISO string, so we support both formats)
- *
- *  - lastUpdated: Timestamp
- *  - pricePerHour: number
- *  - size: "S" | "M" | "L" (optional)
+ * Firestore logs schema written by this page:
+ * logs/{autoId}
+ *  - type
+ *  - source
+ *  - lockerId
+ *  - message
+ *  - details
+ *  - createdAt
  */
 
-// We keep status flexible because your DB uses multiple values
 type DoorStatus = string;
-
-// Lock state is strictly numeric per your requirement
-type LockState = 0 | 1; // 0 = locked, 1 = unlocked
+type LockState = 0 | 1;
 
 type Locker = {
-  id: string;              // Firestore doc ID (ex: "L-101")
+  id: string;
   label?: string;
   location?: string;
-
-  // ✅ Door / reed switch status (Firestore field: status)
-  doorStatus?: DoorStatus;
-
-  // ✅ Solenoid lock state (Firestore field: lockState)
-  lockState?: LockState;
-
-  reservationUntil?: any;  // Timestamp OR ISO string OR null
-  lastUpdated?: any;       // Firestore Timestamp
-
+  doorStatus?: DoorStatus; // mapped from Firestore "status"
+  lockState?: LockState;   // mapped from Firestore "lockState"
+  reservationUntil?: any;
+  lastUpdated?: any;
   pricePerHour?: number;
   size?: "S" | "M" | "L";
 };
@@ -77,28 +65,20 @@ type Locker = {
 export default function LockersPage() {
   const [lockers, setLockers] = useState<Locker[]>([]);
   const [loading, setLoading] = useState(true);
-
   const [showAdd, setShowAdd] = useState(false);
 
-  /**
-   * Add Locker form (admin inputs).
-   * - doorStatus here is only an INITIAL value.
-   *   The ESP32 or mobile app may overwrite status later.
-   * - lockState initializes to 0 (locked).
-   */
   const [form, setForm] = useState({
     id: "",
     label: "",
     location: "",
-    doorStatus: "closed",  // initial door state
+    doorStatus: "closed",
     pricePerHour: 2.0,
     size: "M" as "S" | "M" | "L",
   });
 
   /**
    * ✅ LIVE READ:
-   * Subscribe to /lockers collection.
-   * Any updates from mobile or ESP32 show instantly.
+   * Realtime subscription to /lockers
    */
   useEffect(() => {
     const q = query(collection(db, "lockers"), orderBy("label"));
@@ -113,11 +93,8 @@ export default function LockersPage() {
             id: d.id,
             label: data.label,
             location: data.location,
-
-            // Firestore -> UI mapping
-            doorStatus: data.status,     // ✅ reads door/app status
-            lockState: data.lockState,   // ✅ reads numeric lock state
-
+            doorStatus: data.status,
+            lockState: data.lockState,
             reservationUntil: data.reservationUntil,
             lastUpdated: data.lastUpdated,
             pricePerHour: data.pricePerHour,
@@ -138,30 +115,51 @@ export default function LockersPage() {
   }, []);
 
   /**
-   * Format reservationUntil safely.
-   *
-   * Firestore can store dates as:
-   * 1) Timestamp (has .toDate())
-   * 2) ISO string (like your screenshot)
-   * 3) JS Date
-   *
-   * This supports all three.
+   * Helper:
+   * Write a log entry to /logs.
+   * This lets the dashboard show true activity later.
+   */
+  const writeLog = async ({
+    type,
+    lockerId,
+    message,
+    details,
+  }: {
+    type: string;
+    lockerId?: string;
+    message: string;
+    details?: Record<string, any>;
+  }) => {
+    try {
+      await addDoc(collection(db, "logs"), {
+        type,
+        source: "admin-web",
+        lockerId: lockerId ?? null,
+        message,
+        details: details ?? {},
+        createdAt: serverTimestamp(),
+      });
+    } catch (err) {
+      console.error("Failed to write log:", err);
+    }
+  };
+
+  /**
+   * Formats reservationUntil safely.
+   * Supports Timestamp, ISO string, or JS Date.
    */
   const fmtReservedUntil = (val: any) => {
     if (!val) return "—";
 
-    // Case 1: Firestore Timestamp
     if (typeof val?.toDate === "function") {
       return val.toDate().toLocaleString();
     }
 
-    // Case 2: ISO string
     if (typeof val === "string") {
       const d = new Date(val);
       return isNaN(d.getTime()) ? "—" : d.toLocaleString();
     }
 
-    // Case 3: JS Date
     if (val instanceof Date) {
       return val.toLocaleString();
     }
@@ -170,8 +168,8 @@ export default function LockersPage() {
   };
 
   /**
-   * Door Status pill (reed switch or app status).
-   * We color known values, otherwise show gray pill.
+   * Door status pill:
+   * shows reed/app state separately from solenoid lock state
    */
   const doorStatusPill = (s?: DoorStatus) => {
     const status = (s ?? "unknown").toLowerCase();
@@ -183,8 +181,6 @@ export default function LockersPage() {
       available: "bg-emerald-600/20 text-emerald-300",
       offline: "bg-zinc-700/40 text-zinc-300",
       malfunction: "bg-rose-600/20 text-rose-300",
-      locked: "bg-emerald-600/20 text-emerald-300",
-      unlocked: "bg-blue-600/20 text-blue-300",
       unknown: "bg-zinc-700/40 text-zinc-300",
     };
 
@@ -198,11 +194,12 @@ export default function LockersPage() {
   };
 
   /**
-   * Lock State pill (solenoid).
-   * lockState: 0=locked, 1=unlocked
+   * Lock state pill:
+   * 0 = locked, 1 = unlocked
    */
   const lockStatePill = (lockState?: LockState) => {
     const isUnlocked = lockState === 1;
+
     return (
       <span
         className={`px-2 py-1 rounded text-xs ${
@@ -218,30 +215,37 @@ export default function LockersPage() {
 
   /**
    * ✅ WRITE:
-   * Adds a new locker doc to Firestore.
-   * Doc ID becomes the locker ID.
+   * Adds a new locker doc to /lockers
+   * AND writes a log to /logs
    */
   const addLocker = async () => {
     if (!form.id.trim()) return alert("Locker ID required");
 
-    const ref = doc(db, "lockers", form.id.trim());
+    const lockerId = form.id.trim();
+    const ref = doc(db, "lockers", lockerId);
 
     await setDoc(ref, {
-      id: form.id.trim(),
-      label: form.label || form.id.trim(),
+      id: lockerId,
+      label: form.label || lockerId,
       location: form.location || "Unknown",
-
-      // ✅ Initial reed/app door status
       status: form.doorStatus,
-
-      // ✅ Initial solenoid lock state
-      lockState: 0,
-
+      lockState: 0, // default locked
       reservationUntil: null,
       lastUpdated: serverTimestamp(),
-
       pricePerHour: Number(form.pricePerHour),
       size: form.size,
+    });
+
+    await writeLog({
+      type: "locker_added",
+      lockerId,
+      message: `Locker ${lockerId} was added by admin`,
+      details: {
+        label: form.label || lockerId,
+        location: form.location || "Unknown",
+        pricePerHour: Number(form.pricePerHour),
+        size: form.size,
+      },
     });
 
     setShowAdd(false);
@@ -257,31 +261,49 @@ export default function LockersPage() {
 
   /**
    * ✅ WRITE:
-   * Removes locker doc entirely.
+   * Deletes a locker doc
+   * AND writes a log
    */
   const removeLocker = async (id: string) => {
     if (!confirm(`Remove locker ${id}?`)) return;
+
     await deleteDoc(doc(db, "lockers", id));
+
+    await writeLog({
+      type: "locker_removed",
+      lockerId: id,
+      message: `Locker ${id} was removed by admin`,
+    });
   };
 
   /**
    * ✅ WRITE:
-   * Update pricePerHour only.
+   * Updates pricePerHour
+   * AND writes a log
    */
   const savePrice = async (id: string, pricePerHour: number) => {
     await updateDoc(doc(db, "lockers", id), {
       pricePerHour,
       lastUpdated: serverTimestamp(),
     });
+
+    await writeLog({
+      type: "price_change",
+      lockerId: id,
+      message: `Price updated for locker ${id}`,
+      details: {
+        newPricePerHour: pricePerHour,
+      },
+    });
   };
 
   /**
    * ✅ WRITE:
-   * Toggle lockState directly in Firestore:
+   * Toggle lockState directly:
    * 0 -> 1 (unlock)
    * 1 -> 0 (lock)
    *
-   * This is your solenoid control state.
+   * Also writes a log entry.
    */
   const toggleLockState = async (locker: Locker) => {
     try {
@@ -292,6 +314,16 @@ export default function LockersPage() {
         lockState: next,
         lastUpdated: serverTimestamp(),
       });
+
+      await writeLog({
+        type: next === 1 ? "unlock" : "lock",
+        lockerId: locker.id,
+        message: `Locker ${locker.id} was ${next === 1 ? "unlocked" : "locked"} by admin`,
+        details: {
+          oldLockState: current,
+          newLockState: next,
+        },
+      });
     } catch (err) {
       console.error("Failed to toggle lockState:", err);
       alert("Failed to toggle lockState. Check console.");
@@ -299,11 +331,9 @@ export default function LockersPage() {
   };
 
   /**
-   * Reserved count (simple):
-   * counts any locker that has a reservationUntil value.
-   *
-   * If you later want "reserved only when until>now",
-   * tell me and we’ll switch to a future-only check.
+   * Count reserved lockers.
+   * For now, this simply checks whether reservationUntil exists.
+   * If you want future-only reservations, we can tighten this later.
    */
   const reservedCount = useMemo(
     () => lockers.filter((l) => l.reservationUntil != null).length,
@@ -334,7 +364,7 @@ export default function LockersPage() {
             <label className="text-sm">
               Locker ID (doc id)
               <input
-                                className="w-full mt-1 bg-transparent border border-zinc-700 rounded px-2 py-1"
+                className="w-full mt-1 bg-transparent border border-zinc-700 rounded px-2 py-1"
                 value={form.id}
                 onChange={(e) => setForm({ ...form, id: e.target.value })}
                 placeholder="L-301"
@@ -432,11 +462,8 @@ export default function LockersPage() {
               <th className="p-3 text-left">ID</th>
               <th className="p-3 text-left">Label</th>
               <th className="p-3 text-left">Location</th>
-
-              {/* Two distinct status columns */}
               <th className="p-3 text-center">Door (reed)</th>
               <th className="p-3 text-center">Lock (solenoid)</th>
-
               <th className="p-3 text-center">Reserved Until</th>
               <th className="p-3 text-center">$/hr</th>
               <th className="p-3 text-center">Actions</th>
@@ -466,17 +493,14 @@ export default function LockersPage() {
                 <td className="p-3">{l.label ?? "—"}</td>
                 <td className="p-3">{l.location ?? "—"}</td>
 
-                {/* Door state from reed/app (status) */}
                 <td className="p-3 text-center">
                   {doorStatusPill(l.doorStatus)}
                 </td>
 
-                {/* Lock state from solenoid (lockState) */}
                 <td className="p-3 text-center">
                   {lockStatePill(l.lockState)}
                 </td>
 
-                {/* reservationUntil now renders even if ISO string */}
                 <td className="p-3 text-center">
                   {fmtReservedUntil(l.reservationUntil)}
                 </td>
@@ -488,14 +512,11 @@ export default function LockersPage() {
                     step="0.1"
                     min="0"
                     className="w-24 bg-transparent border border-zinc-700 rounded px-2 py-1"
-                    onBlur={(e) =>
-                      savePrice(l.id, Number(e.target.value))
-                    }
+                    onBlur={(e) => savePrice(l.id, Number(e.target.value))}
                   />
                 </td>
 
                 <td className="p-3 space-x-2 text-center">
-                  {/* Button toggles lockState */}
                   <button
                     className="px-2 py-1 rounded bg-emerald-700/30 hover:bg-emerald-700/50"
                     onClick={() => toggleLockState(l)}
@@ -517,4 +538,73 @@ export default function LockersPage() {
       </div>
     </div>
   );
+}
+
+/**
+ * Helper UI function:
+ * door status pill
+ */
+function doorStatusPill(s?: DoorStatus) {
+  const status = (s ?? "unknown").toLowerCase();
+
+  const map: Record<string, string> = {
+    open: "bg-blue-600/20 text-blue-300",
+    closed: "bg-emerald-600/20 text-emerald-300",
+    reserved: "bg-amber-600/20 text-amber-300",
+    available: "bg-emerald-600/20 text-emerald-300",
+    offline: "bg-zinc-700/40 text-zinc-300",
+    malfunction: "bg-rose-600/20 text-rose-300",
+    unknown: "bg-zinc-700/40 text-zinc-300",
+  };
+
+  const cls = map[status] ?? map.unknown;
+
+  return (
+    <span className={`px-2 py-1 rounded text-xs ${cls}`}>
+      {s ?? "unknown"}
+    </span>
+  );
+}
+
+/**
+ * Helper UI function:
+ * lock state pill
+ */
+function lockStatePill(lockState?: LockState) {
+  const isUnlocked = lockState === 1;
+
+  return (
+    <span
+      className={`px-2 py-1 rounded text-xs ${
+        isUnlocked
+          ? "bg-blue-600/20 text-blue-300"
+          : "bg-emerald-600/20 text-emerald-300"
+      }`}
+    >
+      {isUnlocked ? "unlocked" : "locked"}
+    </span>
+  );
+}
+
+/**
+ * Helper:
+ * format reservationUntil safely
+ */
+function fmtReservedUntil(val: any) {
+  if (!val) return "—";
+
+  if (typeof val?.toDate === "function") {
+    return val.toDate().toLocaleString();
+  }
+
+  if (typeof val === "string") {
+    const d = new Date(val);
+    return isNaN(d.getTime()) ? "—" : d.toLocaleString();
+  }
+
+  if (val instanceof Date) {
+    return val.toLocaleString();
+  }
+
+  return "—";
 }

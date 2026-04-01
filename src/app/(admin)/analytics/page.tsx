@@ -5,50 +5,78 @@ import { db } from "@/lib/FirebaseClient";
 import {
   collection,
   onSnapshot,
-  query,
   orderBy,
+  query,
 } from "firebase/firestore";
 import UsageSection from "@/components/analytics/UsageSection";
 import UsageList from "@/components/analytics/UsageList";
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+  PieChart,
+  Pie,
+  Cell,
+  Legend,
+} from "recharts";
 
 /**
- * ANALYTICS PAGE (LIVE)
+ * ANALYTICS PAGE (LIVE + CHARTS)
  *
  * ✅ READS FROM FIRESTORE:
- *   collection(db, "reservations")
+ *   - /reservations collection
  *
- * Your CURRENT Firestore schema (from screenshot):
- * reservations/{docId} includes:
+ * ❌ DOES NOT WRITE TO FIRESTORE
+ *
+ * Current reservation schema:
+ * reservations/{docId}
  *  - createdAt: Timestamp
  *  - startAt: Timestamp
  *  - endAt: string (ISO date)
  *  - lockerId: string
- *  - status: string ("active", ...)
+ *  - status: string
  *  - userId: string
  *
- * This file computes usage analytics using ONLY what exists now.
- * If you add revenue fields later, we can extend this page.
+ * This page calculates and displays:
+ *  - total reservations
+ *  - average reservation duration
+ *  - peak hour
+ *  - unique users
+ *  - reservations per day (bar chart)
+ *  - most-used lockers (list)
+ *  - reservation status breakdown (pie chart)
  */
 
-// Type describing your reservation documents
 type Reservation = {
   lockerId?: string;
-  createdAt?: any;   // Firestore Timestamp
-  startAt?: any;     // Firestore Timestamp
-  endAt?: string | any; // ISO string currently, but may become Timestamp later
+  createdAt?: any;
+  startAt?: any;
+  endAt?: any;
   status?: string;
   userId?: string;
 };
 
+const PIE_COLORS = [
+  "#60a5fa", // blue
+  "#34d399", // green
+  "#fbbf24", // amber
+  "#f87171", // red
+  "#a78bfa", // purple
+  "#94a3b8", // slate
+];
+
 export default function AnalyticsPage() {
-  // Holds ALL reservations live from Firestore
+  // Holds live Firestore reservation docs
   const [reservations, setReservations] = useState<Reservation[]>([]);
   const [loading, setLoading] = useState(true);
 
   /**
    * ✅ LIVE READ:
-   * onSnapshot listens to /reservations in real-time.
-   * Any new reservation from the mobile app will instantly update analytics.
+   * Subscribe to /reservations so analytics updates automatically.
    */
   useEffect(() => {
     const qRes = query(
@@ -59,7 +87,6 @@ export default function AnalyticsPage() {
     const unsub = onSnapshot(
       qRes,
       (snap) => {
-        // Convert snapshot -> plain JS objects
         const rows = snap.docs.map((d) => d.data() as Reservation);
         setReservations(rows);
         setLoading(false);
@@ -70,38 +97,42 @@ export default function AnalyticsPage() {
       }
     );
 
-    // Cleanup listener
     return () => unsub();
   }, []);
 
-  /** Total reservations in DB */
-  const totalReservations = reservations.length;
-
   /**
-   * Helper: Convert Firestore Timestamp OR ISO string into Date.
-   * - startAt is a Firestore timestamp
-   * - endAt is currently stored as ISO string
+   * Helper:
+   * Convert Firestore Timestamp, ISO string, or JS Date into a Date.
    */
   const parseDate = (value: any): Date | null => {
     if (!value) return null;
 
-    // Firestore Timestamp case
+    // Firestore Timestamp
     if (typeof value?.toDate === "function") {
       return value.toDate();
     }
 
-    // ISO string case
+    // ISO string
     if (typeof value === "string") {
       const d = new Date(value);
       return isNaN(d.getTime()) ? null : d;
+    }
+
+    // JS Date
+    if (value instanceof Date) {
+      return value;
     }
 
     return null;
   };
 
   /**
-   * Average reservation duration in minutes:
-   * avg(endAt - startAt)
+   * KPI 1: Total reservations
+   */
+  const totalReservations = reservations.length;
+
+  /**
+   * KPI 2: Average reservation duration in minutes
    */
   const avgDurationMin = useMemo(() => {
     const durations: number[] = [];
@@ -122,8 +153,7 @@ export default function AnalyticsPage() {
   }, [reservations]);
 
   /**
-   * Peak usage hour:
-   * counts which hour of day reservations start most often.
+   * KPI 3: Peak reservation start hour
    */
   const peakHour = useMemo(() => {
     const hourCounts = new Array(24).fill(0);
@@ -132,8 +162,8 @@ export default function AnalyticsPage() {
       const start = parseDate(r.startAt);
       if (!start) return;
 
-      const h = start.getHours();
-      hourCounts[h]++;
+      const hour = start.getHours();
+      hourCounts[hour]++;
     });
 
     const max = Math.max(...hourCounts);
@@ -143,7 +173,44 @@ export default function AnalyticsPage() {
   }, [reservations]);
 
   /**
-   * Top 5 lockers by number of reservations.
+   * KPI 4: Unique users
+   */
+  const uniqueUsers = useMemo(() => {
+    const users = new Set<string>();
+
+    reservations.forEach((r) => {
+      if (r.userId) users.add(r.userId);
+    });
+
+    return users.size;
+  }, [reservations]);
+
+  /**
+   * Reservations per day
+   * Used for the bar chart.
+   */
+  const reservationsPerDay = useMemo(() => {
+    const map: Record<string, number> = {};
+
+    reservations.forEach((r) => {
+      const created = parseDate(r.createdAt);
+      if (!created) return;
+
+      const key = created.toISOString().slice(0, 10); // YYYY-MM-DD
+      map[key] = (map[key] || 0) + 1;
+    });
+
+    return Object.entries(map)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([day, count]) => ({
+        day,
+        count,
+      }));
+  }, [reservations]);
+
+  /**
+   * Most-used lockers
+   * Used in the list section.
    */
   const topLockers = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -160,46 +227,38 @@ export default function AnalyticsPage() {
   }, [reservations]);
 
   /**
-   * Reservations per day:
-   * groups by createdAt date (YYYY-MM-DD).
-   */
-  const reservationsPerDay = useMemo(() => {
-    const map: Record<string, number> = {};
-
-    reservations.forEach((r) => {
-      const created = parseDate(r.createdAt);
-      if (!created) return;
-
-      const key = created.toISOString().slice(0, 10);
-      map[key] = (map[key] || 0) + 1;
-    });
-
-    return Object.entries(map).sort(([a], [b]) => a.localeCompare(b));
-  }, [reservations]);
-
-  /**
-   * Active vs expired/cancelled distribution
-   * (uses your current status field).
+   * Status breakdown
+   * Used in the pie chart.
    */
   const statusBreakdown = useMemo(() => {
     const map: Record<string, number> = {};
+
     reservations.forEach((r) => {
-      const s = r.status ?? "unknown";
-      map[s] = (map[s] || 0) + 1;
+      const status = (r.status ?? "unknown").toLowerCase();
+      map[status] = (map[status] || 0) + 1;
     });
-    return Object.entries(map).sort((a, b) => b[1] - a[1]);
+
+    return Object.entries(map)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name, value]) => ({
+        name,
+        value,
+      }));
   }, [reservations]);
 
   return (
     <div className="space-y-6">
       <h2 className="text-xl font-semibold">Usage Analytics</h2>
+      <p className="text-sm text-zinc-400">
+        Live reservation data from Firestore is visualized below for expo/demo use.
+      </p>
 
-      {/* Summary cards */}
-      <div className="grid gap-4 md:grid-cols-3">
+      {/* Top KPI cards */}
+      <div className="grid gap-4 md:grid-cols-4">
         <UsageSection
           title="Total Reservations"
           value={loading ? "…" : `${totalReservations}`}
-          hint="Count of docs in /reservations"
+          hint="Docs in /reservations"
         />
 
         <UsageSection
@@ -223,69 +282,86 @@ export default function AnalyticsPage() {
               ? "—"
               : `${peakHour}:00`
           }
-          hint="Most common reservation start time"
+          hint="Most common start hour"
+        />
+
+        <UsageSection
+          title="Unique Users"
+          value={loading ? "…" : `${uniqueUsers}`}
+          hint="Distinct userId count"
         />
       </div>
 
-      {/* Reservations trend section */}
+      {/* Reservations Per Day Chart */}
       <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
-        <h3 className="text-sm font-medium mb-2">
-          Reservations per day
-        </h3>
+        <h3 className="text-sm font-medium mb-3">Reservations Per Day</h3>
 
-        {loading && <p className="text-sm text-zinc-500">Loading…</p>}
-
-        {!loading && reservationsPerDay.length === 0 && (
-          <p className="text-sm text-zinc-500">No reservations yet.</p>
-        )}
-
-        {!loading && reservationsPerDay.length > 0 && (
-          <ul className="text-sm space-y-1">
-            {reservationsPerDay.map(([day, count]) => (
-              <li
-                key={day}
-                className="flex justify-between border-b border-zinc-800 py-1"
-              >
-                <span>{day}</span>
-                <span>{count}</span>
-              </li>
-            ))}
-          </ul>
-        )}
-
-        {/* TODO(chart):
-            Replace this list with a Line/Bar chart later if desired */}
-      </div>
-
-      {/* Top lockers section */}
-      <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
-        <h3 className="text-sm font-medium mb-2">
-          Most-used lockers
-        </h3>
-        <UsageList items={topLockers} />
-      </div>
-
-      {/* Status breakdown section */}
-      <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
-        <h3 className="text-sm font-medium mb-2">
-          Reservation status breakdown
-        </h3>
-
-        {statusBreakdown.length === 0 ? (
-          <p className="text-sm text-zinc-500">No data yet.</p>
+        {loading ? (
+          <p className="text-sm text-zinc-500">Loading chart…</p>
+        ) : reservationsPerDay.length === 0 ? (
+          <p className="text-sm text-zinc-500">No reservation trend data yet.</p>
         ) : (
-          <ul className="text-sm space-y-1">
-            {statusBreakdown.map(([status, count]) => (
-              <li
-                key={status}
-                className="flex justify-between border-b border-zinc-800 py-1"
-              >
-                <span>{status}</span>
-                <span>{count}</span>
-              </li>
-            ))}
-          </ul>
+          <div className="h-72">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={reservationsPerDay}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+                <XAxis dataKey="day" stroke="#a1a1aa" fontSize={12} />
+                <YAxis stroke="#a1a1aa" fontSize={12} />
+                <Tooltip />
+                <Bar dataKey="count" fill="#60a5fa" radius={[4, 4, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
         )}
+      </div>
+
+      <div className="grid gap-6 lg:grid-cols-2">
+        {/* Top lockers list */}
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+          <h3 className="text-sm font-medium mb-3">Most-Used Lockers</h3>
+
+          {loading ? (
+            <p className="text-sm text-zinc-500">Loading top lockers…</p>
+          ) : (
+            <UsageList items={topLockers} />
+          )}
+        </div>
+
+        {/* Status pie chart */}
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+          <h3 className="text-sm font-medium mb-3">Reservation Status Breakdown</h3>
+
+          {loading ? (
+            <p className="text-sm text-zinc-500">Loading status chart…</p>
+          ) : statusBreakdown.length === 0 ? (
+            <p className="text-sm text-zinc-500">No status data available yet.</p>
+          ) : (
+            <div className="h-72">
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie
+                    data={statusBreakdown}
+                    dataKey="value"
+                    nameKey="name"
+                    cx="50%"
+                    cy="50%"
+                    outerRadius={90}
+                    label
+                  >
+                    {statusBreakdown.map((entry, index) => (
+                      <Cell
+                        key={`cell-${entry.name}`}
+                        fill={PIE_COLORS[index % PIE_COLORS.length]}
+                      />
+                    ))}
+                  </Pie>
+                  <Tooltip />
+                  <Legend />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
