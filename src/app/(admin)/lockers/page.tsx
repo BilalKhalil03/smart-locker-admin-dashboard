@@ -13,6 +13,7 @@ import {
   query,
   orderBy,
   addDoc,
+  documentId,
 } from "firebase/firestore";
 
 /**
@@ -81,7 +82,8 @@ export default function LockersPage() {
    * Realtime subscription to /lockers
    */
   useEffect(() => {
-    const q = query(collection(db, "lockers"), orderBy("label"));
+    // Sort by Firestore document ID so order matches the Firebase collection list better
+    const q = query(collection(db, "lockers"), orderBy(documentId()));
 
     const unsub = onSnapshot(
       q,
