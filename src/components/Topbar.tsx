@@ -12,14 +12,8 @@ export default function Topbar() {
 
       {/* TODO(auth): Replace with the actual signed-in admin email */}
       <div className="ml-auto flex items-center gap-3">
-        <span className="text-sm text-zinc-400 hidden sm:block">admin@example.com</span>
-        <button
-          className="p-2 rounded hover:bg-zinc-800"
-          title="Sign out"
-          // onClick={() => signOut(auth)}
-        >
-          <LogOut className="w-5 h-5" />
-        </button>
+       
+       
       </div>
     </header>
   );
